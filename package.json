@@ -1,0 +1,22 @@
+{
+  "name": "project-athena-build-uploader",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Thoys",
+  "license": "ISC",
+  "dependencies": {
+    "@octokit/rest": "^16.36.0",
+    "chromedriver": "^79.0.0",
+    "concat-stream": "^2.0.0",
+    "crypto": "^1.0.1",
+    "dotenv": "^8.2.0",
+    "express": "^4.17.1",
+    "http-status-codes": "^1.4.0",
+    "node-fetch": "^2.6.0",
+    "selenium-webdriver": "^4.0.0-alpha.5"
+  }
+}
