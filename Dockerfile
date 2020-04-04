@@ -27,7 +27,10 @@ RUN apk update && apk add --no-cache bash \
         xvfb \
         zlib-dev \
         chromium \
-        chromium-chromedriver
+        chromium-chromedriver \
+        python
+
+RUN apk add --no-cache make g++
 
 # Create app directory
 WORKDIR /usr/src/app

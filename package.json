@@ -10,6 +10,7 @@
   "license": "ISC",
   "dependencies": {
     "@octokit/rest": "^16.36.0",
+    "@sentry/node": "^5.10.2",
     "chromedriver": "^79.0.0",
     "concat-stream": "^2.0.0",
     "crypto": "^1.0.1",
@@ -17,6 +18,8 @@
     "express": "^4.17.1",
     "http-status-codes": "^1.4.0",
     "node-fetch": "^2.6.0",
-    "selenium-webdriver": "^4.0.0-alpha.5"
+    "selenium-webdriver": "^4.0.0-alpha.5",
+    "sleep": "^6.1.0",
+    "yaml": "^1.8.3"
   }
 }
