@@ -1,16 +1,15 @@
-require('chromedriver');
-const {Builder, By, Key, until} = require('selenium-webdriver');
-const chrome = require('selenium-webdriver/chrome');
 const Sentry = require('@sentry/node');
-const sleep = require('sleep');
 const express = require('express');
 const crypto = require('crypto');
-const Octokit = require("@octokit/rest");
+const { Octokit } = require("@octokit/rest");
 const HttpStatus = require('http-status-codes');
 const concat = require('concat-stream');
 const YAML = require('yaml');
 const fs = require('fs');
 const path = require('path');
+const AWS = require('aws-sdk');
+
+let suitePublishRuns = {};
 
 let config = null;
 try {
@@ -21,78 +20,27 @@ try {
     return;
 }
 
-const screen = {
-    width: 640,
-    height: 480
-};
-
-require('dotenv').config();
-
-const LISTENING_PORT = Number(process.env.LISTENING_PORT || 3000);
-const ALLOWED_REPOS = Object.keys(config.repositories); //process.env.ALLOWED_REPOS.split(";");
-const CHECKSUM_ACTION_NAME = process.env.CHECKSUM_ACTION_NAME || "Hash artifacts";
-const BUILD_UPLOAD_ALLOWED_LABEL = process.env.BUILD_UPLOAD_ALLOWED_LABEL || "allow-build-upload";
+const LISTENING_PORT = Number(config.listening_port || 3000);
+const ALLOWED_REPOS = Object.keys(config.repositories);
+const BUILD_UPLOAD_ALLOWED_LABEL = config.build_allowed_upload_label || "allow-build-upload";
 const BUILD_FILE_HASHES_REGEX = "BuildFileHashes: (\\[(.+)\\])";
 
 Sentry.init({ dsn: config.sentry_dsn });
 
-let isSeleniumBusy = false;
-
-async function getChecksumFromCheckRun(githubCheckRunURL, checksumActionName) {
-    let checksumStepText = "";
-
-    while (isSeleniumBusy) {
-        // waiting for selenium to be done.
-        sleep.msleep(50);
-    }
-    isSeleniumBusy = true;
-
-    let chromeOptions = new chrome.Options();
-    chromeOptions.headless();
-    chromeOptions.windowSize(screen);
-    chromeOptions.addArguments("--no-sandbox");
-    chromeOptions.addArguments("--disable-dev-shm-usage");
-    let driver;
-    try {
-        driver = new Builder().forBrowser('chrome')
-            .setChromeOptions(chromeOptions)
-            .build();
-
-        await driver.get(githubCheckRunURL);
-        let checksumStepLabel = await driver.findElement(By.xpath("//*[text()='" + checksumActionName + "']"));
-        let checksumStep = await checksumStepLabel.findElement(By.xpath("./../.."));
-
-        await checksumStep.click();
-        let startCheckingForLogMS = Date.now();
-        await driver.wait(until.elementLocated(By.className('js-checks-log-group')), 10000);
-        console.log("It took " + (Date.now() - startCheckingForLogMS) + "ms to wait for the element to load.");
-
-        let logClass = await checksumStep.findElement(By.className('js-checks-log-group'));
-        await logClass.click();
-
-        await checksumStep.getText().then((text) => {
-            checksumStepText = text;
-        });
-        console.log(checksumStepText);
-    } catch (e) {
-        Sentry.captureException(e);
-    } finally {
-        if (driver) {
-            await driver.quit();
-        }
-        isSeleniumBusy = false;
-    }
-    return checksumStepText;
-}
-
 const app = express();
 
-const octokit = Octokit({
+const octokit = new Octokit({
     auth: config.github_auth_token
 });
 
+app.use('/webhook', express.json());
 
 app.use(async (request, response, next) => {
+    if (request.path === '/webhook') {
+        next();
+        return;
+    }
+
     const {owner, repo, commit_hash, pull_number, job_name} = request.headers;
     if (!owner || !repo || !commit_hash || !pull_number || !job_name) {
         response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('One of the required headers is not set correctly.');
@@ -128,15 +76,6 @@ function isPRBuildAllowedToBeUploaded(pull_request_data) {
         pull_request_data.labels.some(label => label.name === BUILD_UPLOAD_ALLOWED_LABEL);
 }
 
-async function asyncSome(array, callback) {
-    for (let index = 0; index < array.length; index++) {
-        if (await callback(array[index], index, array)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 function getStoragePath(path, variables) {
     return path.replace(/\[\:([a-zA-Z0-9_]+)\]/g, (match, variable_key) => {
         if (variables[variable_key] === undefined) {
@@ -147,14 +86,187 @@ function getStoragePath(path, variables) {
     });
 }
 
+async function publishRuns(check_suite_id) {
+    const requests = suitePublishRuns[check_suite_id];
+    delete suitePublishRuns[check_suite_id];
+
+    let publishUrls = [];
+    let areGlobalCheckSuiteVariablesSet = false;
+    let globalPullNumber = false;
+    let globalOwner = null;
+    let globalRepo = null;
+
+    for (let requestKey in requests) {
+        if (!requests.hasOwnProperty(requestKey)) {
+            continue;
+        }
+        let request = requests[requestKey];
+        const {owner, repo, commit_hash, pull_number, job_name, run_id} = request.headers;
+        if (!areGlobalCheckSuiteVariablesSet) {
+            globalPullNumber = pull_number;
+            globalOwner = owner;
+            globalRepo = repo;
+            areGlobalCheckSuiteVariablesSet = true;
+        }
+
+        const fileHash = request.fileHash;
+        const repositoryConfig = config.repositories[`${owner}/${repo}`];
+
+        let jobsForWorkflowRun = (await octokit.actions.listJobsForWorkflowRun({
+            owner,
+            repo,
+            run_id
+        }).catch((e) => {
+            console.log(e);
+        })).data;
+        console.log('workflow run jobs: ' + JSON.stringify(jobsForWorkflowRun));
+
+        let actualJobID = null;
+        let isJobCompleted = false;
+        if (!jobsForWorkflowRun.jobs.some((job) => {
+            if (job.name === job_name) {
+                actualJobID = job.id;
+                isJobCompleted = job.status === "completed";
+                return true;
+            }
+            return false;
+        })) {
+            console.log(`Failed to find matching job_name in running jobs.`);
+            return false;
+        }
+
+        let logs = (await octokit.actions.listWorkflowJobLogs({
+            owner,
+            repo,
+            job_id: actualJobID
+        }).catch((e) => {
+            console.log(e);
+        })).data;
+
+        let targetFilename = null;
+        let regExp = new RegExp(BUILD_FILE_HASHES_REGEX, 'gm');
+        let match = regExp.exec(logs);
+        if (!match) {
+            console.log(`check_run ${check_run.name} doesn't have build file hashes.`);
+            continue;
+        }
+        let buildFileHashes;
+        try {
+            buildFileHashes = JSON.parse(match[1]);
+        } catch (e) {
+            console.log(`failed to parse build hashes.`);
+            Sentry.captureException(e);
+            continue;
+        }
+
+        console.log('buildFileHashes: ' + JSON.stringify(buildFileHashes));
+
+        console.log(`Looking for the filename of artifact with the hash ${fileHash}.`);
+
+        let buildFileHashPair = buildFileHashes.find((buildFileHash) => {
+            return buildFileHash.sha256_checksum === fileHash;
+        });
+
+        if (!buildFileHashPair) {
+            console.log(`Failed to find build hash in JSON object.`);
+            continue;
+        }
+
+        targetFilename = buildFileHashPair.filename;
+
+        console.log(`Found ${targetFilename} with selected hash ${fileHash}.`);
+
+        // Storage
+        let file_name = targetFilename;
+        let file_extname = path.extname(file_name);
+        let file_basename = path.basename(file_name, file_extname);
+
+        const repositoryStorages = repositoryConfig.storages;
+        for (let repositoryStorageKey in repositoryStorages) {
+            if (!repositoryStorages.hasOwnProperty(repositoryStorageKey)) {
+                continue;
+            }
+            const repositoryStorage = repositoryStorages[repositoryStorageKey];
+            const storage = config.storages[repositoryStorage.storage];
+            const storageParams = {
+                owner,
+                repo,
+                pull_number,
+                file_name,
+                file_basename,
+                file_extname,
+                commit_short_hash: commit_hash.substring(0, 8)
+            };
+            const storagePath = getStoragePath(storage.path, storageParams);
+
+            if (storage.method === 'file') {
+                try {
+                    let storageDirectory = path.dirname(storagePath);
+                    if (!fs.existsSync(storageDirectory)) {
+                        fs.mkdirSync(storageDirectory, { recursive: true });
+                    }
+                    await fs.writeFile(storagePath, request.body, function (err) {
+                        if (err) {
+                            throw err;
+                        }
+                        console.log('Saved ' + fileHash + '!');
+                    });
+                    if (repositoryStorage.publish_url) {
+                        publishUrls.push(storagePath);
+                    }
+                } catch (err) {
+                    Sentry.captureException(err);
+                    console.log(JSON.stringify(err));
+                    continue;
+                }
+            } else if (storage.method === 'S3') {
+                // Create S3 service object
+                let s3 = new AWS.S3({
+                    apiVersion: '2006-03-01',
+                    region: storage.region,
+                    credentials: new AWS.Credentials(storage.accessKeyId, storage.secretAccessKey)
+                });
+                let data = (await s3.upload({
+                    Bucket: storage.bucket,
+                    Key: storagePath,
+                    Body: request.body,
+                    ACL: 'public-read'
+                }).promise().catch((err) => {
+                    console.log("Error", err);
+                }));
+                console.log('s3 upload output = ' + JSON.stringify(data));
+
+                if (repositoryStorage.publish_url) {
+                    publishUrls.push(getStoragePath(storage.public_url, storageParams));
+                }
+            }
+            console.log(storagePath);
+        }
+    }
+
+    if (publishUrls.length > 0) {
+        // Publish a message with build links
+        octokit.issues.createComment({
+            owner: globalOwner,
+            repo: globalRepo,
+            issue_number: globalPullNumber,
+            body: 'The following links are available: ' + publishUrls.join(', ')
+        }).catch((e) => {
+            Sentry.captureException(e);
+            console.error('Caught error: ', JSON.stringify(e));
+        });
+    }
+}
+
 app.listen(LISTENING_PORT, () => console.log(`App listening on port ${LISTENING_PORT}!`));
 
 app.put('/', async function (request, response) {
     try {
         const fileHash = crypto.createHash('sha256').update(request.body).digest('hex');
+        request.fileHash = fileHash;
         console.log(fileHash);
-        const {owner, repo, commit_hash, pull_number, job_name} = request.headers;
-        const repositoryConfig = config.repositories[`${owner}/${repo}`];
+        const {owner, repo, commit_hash, pull_number, job_name, run_id} = request.headers;
+
         let check_run_data = (await octokit.checks.listForRef({
             owner,
             repo,
@@ -162,104 +274,47 @@ app.put('/', async function (request, response) {
             check_name: job_name
         })).data;
 
-        console.log(check_run_data);
+        console.log(JSON.stringify(check_run_data));
 
-        (async function() {
-            let targetFilename = null;
-            let checksumMatch = await asyncSome(check_run_data.check_runs, async (check_run) => {
-                let checksumText = await getChecksumFromCheckRun(check_run.html_url, CHECKSUM_ACTION_NAME);
-                console.log('check_run name = ' + check_run.name + ' text: ' + checksumText);
-                let regExp = new RegExp(BUILD_FILE_HASHES_REGEX, 'gm');
-                let match = regExp.exec(checksumText);
-                if (!match) {
-                    console.log(`check_run ${check_run.name} doesn't have build file hashes.`);
-                    response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Received file checksum does not match any found checksum.');
-                    return false;
-                }
-                let buildFileHashes;
-                try {
-                    buildFileHashes = JSON.parse(match[1]);
-                } catch (e) {
-                    console.log(`failed to parse build hashes.`);
-                    Sentry.captureException(e);
-                    response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Failed to parse build hashes. Could be an invalid JSON object.');
-                    return false;
-                }
+        const checksuite_id = check_run_data.check_runs[0].check_suite.id;
+        console.log('checkrun id = ' + check_run_data.check_runs[0].id);
+        console.log('checksuite id = ' + checksuite_id);
 
-                console.log('buildFileHashes: ' + JSON.stringify(buildFileHashes));
+        console.log('run_id = ' + run_id);
 
-                console.log(`Looking for the filename of artifact with the hash ${fileHash}.`);
+        if (suitePublishRuns[checksuite_id] === undefined) {
+            suitePublishRuns[checksuite_id] = [];
+        }
+        suitePublishRuns[checksuite_id].push(request);
 
-                let buildFileHashPair = buildFileHashes.find((buildFileHash) => {
-                    return buildFileHash.sha256_checksum === fileHash;
-                });
-
-                if (!buildFileHashPair) {
-                    console.log(`Failed to find build hash in JSON object.`);
-                    response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Failed to find build hash in JSON object.');
-                    return false;
-                }
-
-                targetFilename = buildFileHashPair.filename;
-
-                console.log(`Found ${targetFilename} with selected hash ${fileHash}.`);
-/*
-                fs.writeFile(fileHash, request.body, function (err) {
-                    if (err) throw err;
-                    console.log('Saved ' + fileHash + '!');
-                });
-*/
-                return true;
-            });
-
-            if (!checksumMatch) {
-                response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Received file checksum does not match any found checksum.');
-                return;
-            }
-
-            // Storage
-
-            let file_name = targetFilename;
-            let file_extname = path.extname(file_name);
-            let file_basename = path.basename(file_name, file_extname);
-
-            const repositoryStorages = repositoryConfig.storages;
-            let publishUrls = [];
-            repositoryStorages.forEach((repositoryStorage) => {
-                const storage = config.storages[repositoryStorage.storage];
-                const storagePath = getStoragePath(storage.path, {
-                    owner,
-                    repo,
-                    pull_number,
-                    file_name,
-                    file_basename,
-                    file_extname,
-                    commit_short_hash: commit_hash
-                });
-
-                if (storage.method === 'file') {
-                    fs.writeFile(storagePath, request.body, function (err) {
-                        if (err) throw err;
-                        console.log('Saved ' + fileHash + '!');
-                    });
-                    if (repositoryStorage.publish_url) {
-                        publishUrls.push(storagePath);
-                    }
-                } else if (storage.method === 'S3') {
-
-                }
-
-                console.log(storagePath);
-            });
-
-            console.log('done');
-            response.send({
-                success: true
-            });
-        }());
+        response.send({
+            success: true,
+            message: "Publishing procedure started, unfortunately the GHA will have to finish before this."
+        });
     } catch (err) {
         console.log("err = " + err);
         Sentry.captureException(err);
         response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Error happened please check server logs.');
+    }
+});
+
+function getSignatureForBody(body) {
+    return 'sha1='+ crypto.createHmac('sha1', config.repositories[body.repository.full_name].gh_notify_secret)
+        .update(JSON.stringify(body))
+        .digest('hex')
+}
+
+app.post('/webhook', async function(request, response) {
+    const signature = request.headers['x-hub-signature'];
+    const event = request.headers['x-github-event'];
+    const expectedSignature = getSignatureForBody(request.body);
+
+    if (signature !== expectedSignature) {
+        response.status(HttpStatus.UNAUTHORIZED).send('Webhook authentication failure.');
+        return;
+    }
+
+    if (event === 'check_suite' && request.body.action === 'completed') {
+        await publishRuns(request.body.check_suite.id)
     }
 });
