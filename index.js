@@ -90,7 +90,7 @@ async function publishRuns(check_suite_id) {
     const requests = suitePublishRuns[check_suite_id];
     delete suitePublishRuns[check_suite_id];
 
-    let publishUrls = [];
+    let publishUrls = {};
     let areGlobalCheckSuiteVariablesSet = false;
     let globalPullNumber = false;
     let globalOwner = null;
@@ -176,6 +176,8 @@ async function publishRuns(check_suite_id) {
 
         console.log(`Found ${targetFilename} with selected hash ${fileHash}.`);
 
+        publishUrls[job_name] = [];
+
         // Storage
         let file_name = targetFilename;
         let file_extname = path.extname(file_name);
@@ -186,6 +188,7 @@ async function publishRuns(check_suite_id) {
             if (!repositoryStorages.hasOwnProperty(repositoryStorageKey)) {
                 continue;
             }
+
             const repositoryStorage = repositoryStorages[repositoryStorageKey];
             const storage = config.storages[repositoryStorage.storage];
             const storageParams = {
@@ -212,7 +215,7 @@ async function publishRuns(check_suite_id) {
                         console.log('Saved ' + fileHash + '!');
                     });
                     if (repositoryStorage.publish_url) {
-                        publishUrls.push(storagePath);
+                        publishUrls[job_name].push(storagePath);
                     }
                 } catch (err) {
                     Sentry.captureException(err);
@@ -237,20 +240,36 @@ async function publishRuns(check_suite_id) {
                 console.log('s3 upload output = ' + JSON.stringify(data));
 
                 if (repositoryStorage.publish_url) {
-                    publishUrls.push(getStoragePath(storage.public_url, storageParams));
+                    publishUrls[job_name].push(getStoragePath(storage.public_url, storageParams));
                 }
             }
             console.log(storagePath);
         }
     }
 
-    if (publishUrls.length > 0) {
+    let urlCount = Object.values(publishUrls).reduce((a, b) => {
+        return a.concat(b);
+    }).length;
+
+    if (urlCount > 0) {
+        let message = "";
+        for (let publishUrlJobName in publishUrls) {
+            if (!publishUrls.hasOwnProperty(publishUrlJobName)) {
+                continue;
+            }
+            let urls = publishUrls[publishUrlJobName];
+            if (urls.length > 0) {
+                message += `**${publishUrlJobName}**\n - ` + urls.join('\n - ') + '\n\n';
+            }
+        }
+
+
         // Publish a message with build links
         octokit.issues.createComment({
             owner: globalOwner,
             repo: globalRepo,
             issue_number: globalPullNumber,
-            body: 'The following links are available: ' + publishUrls.join(', ')
+            body: 'The following links are available: \n' + message
         }).catch((e) => {
             Sentry.captureException(e);
             console.error('Caught error: ', JSON.stringify(e));
