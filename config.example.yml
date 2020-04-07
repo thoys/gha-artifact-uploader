@@ -1,0 +1,25 @@
+#sentry_dsn: Sentry_DSN_URL_Here
+## Default listening port is 3000, set it using this variable:
+#listening_port: 3000
+storages:
+  your_s3_storage:
+    method: S3
+    accessKeyId: YOUR_ACCESS_KEY_ID_FOR_S3
+    secretAccessKey: YOUR_SECRET_ACCESS_KEY_FOR_S3
+    bucket: your-s3-bucket-name
+    region: your-s3-region
+    path: builds/PR/[:owner]_[:repo]/PR[:pull_number]/[:file_basename]_[:commit_short_hash][:file_extname]
+    public_url: https://your-bucket-url.s3.amazonaws.com/builds/PR/[:owner]_[:repo]/PR[:pull_number]/[:file_basename]_[:commit_short_hash][:file_extname]
+  local_disk:
+    method: file
+    path: ./storage/[:owner]_[:repo]/PR[:pull_number]/[:file_basename]_[:commit_short_hash][:file_extname]
+github_auth_token: your_notify_bots_personal_github_auth_token_here
+repositories:
+  your_github_username/your_repository:
+    storages:
+      local:
+        storage: local_disk
+        publish_url: false
+      s3_upload:
+        storage: your_s3_storage
+        publish_url: true

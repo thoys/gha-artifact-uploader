@@ -15,7 +15,7 @@ try {
     const configFileContents = fs.readFileSync('./config.yml', 'utf8');
     config = YAML.parse(configFileContents);
 } catch (e) {
-    console.error('Failed to load config.yml be sure exists otherwise copy config.yml.example and modify it to your needs.');
+    console.error('Failed to load config.yml be sure exists otherwise copy config.example.yml and modify it to your needs.');
     return;
 }
 
