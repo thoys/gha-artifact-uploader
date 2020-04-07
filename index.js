@@ -3,7 +3,6 @@ const express = require('express');
 const crypto = require('crypto');
 const { Octokit } = require("@octokit/rest");
 const HttpStatus = require('http-status-codes');
-const concat = require('concat-stream');
 const YAML = require('yaml');
 const fs = require('fs');
 const path = require('path');
@@ -41,8 +40,8 @@ app.use(async (request, response, next) => {
         return;
     }
 
-    const {owner, repo, commit_hash, pull_number, job_name} = request.headers;
-    if (!owner || !repo || !commit_hash || !pull_number || !job_name) {
+    const {owner, repo, commit_hash, pull_number, job_name, file_sizes} = request.headers;
+    if (!owner || !repo || !commit_hash || !pull_number || !job_name || !file_sizes) {
         response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('One of the required headers is not set correctly.');
         return;
     }
@@ -56,17 +55,62 @@ app.use(async (request, response, next) => {
             .send(`Please label PR build next time with the ${BUILD_UPLOAD_ALLOWED_LABEL} label.`);
         return;
     }
-    let pull_commits = (await octokit.pulls.listCommits({owner, repo, pull_number, per_page: 100})).data;
+    let pull_commits = (await octokit.pulls.listCommits({
+        owner,
+        repo,
+        pull_number,
+        per_page: 1,
+        page: pull_data.commits
+    })).data;
     if (!pull_commits.some(commit => commit.sha === commit_hash)) {
         response.status(HttpStatus.INTERNAL_SERVER_ERROR)
             .send(`Pull request does not contains commit sha: ${commit_hash}.`);
         return;
     }
 
-    request.pipe(concat(function (data) {
-        request.body = data;
+    let file_sizes_list = file_sizes.split(',').map(file_size => parseInt(file_size));
+    let file_index = 0;
+    request.files = [];
+    let hash = crypto.createHash('sha256');
+    let fileBuffers = [];
+    let fileSeek = 0;
+    let fileSize = file_sizes_list[file_index];
+
+    request.on('data', (chunk) => {
+        let readData = chunk;
+        while (readData.length > 0) {
+            let dataLength = readData.length;
+            let bytesToGo = fileSize - fileSeek;
+            // only read part of this file
+            let readLength = Math.min(bytesToGo, dataLength);
+            fileSeek += readLength;
+            let readDataNow = readData.slice(0, readLength);
+            let remainingData = readData.slice(readLength, readData.length);
+            hash.update(readDataNow);
+            fileBuffers.push(readDataNow);
+            if (remainingData.length > 0 || fileSeek === fileSize) {
+                console.log('Reading of file completed');
+                request.files.push({
+                    hash: hash.digest('hex'),
+                    buffer: Buffer.concat(fileBuffers),
+                    fileSize,
+                    verified: false
+                });
+
+                if (file_index < (file_sizes_list.length - 1)) {
+                    // Go to next file
+                    file_index++;
+                    fileSize = file_sizes_list[file_index];
+                    fileSeek = 0;
+                    fileBuffers = [];
+                    hash = crypto.createHash('sha256');
+                }
+            }
+            readData = remainingData;
+        }
+    }).on('end', () => {
         next();
-    }));
+    });
 });
 
 function isPRBuildAllowedToBeUploaded(pull_request_data) {
@@ -109,7 +153,6 @@ async function publishRuns(check_suite_id) {
             areGlobalCheckSuiteVariablesSet = true;
         }
 
-        const fileHash = request.fileHash;
         const repositoryConfig = config.repositories[`${owner}/${repo}`];
 
         let jobsForWorkflowRun = (await octokit.actions.listJobsForWorkflowRun({
@@ -143,7 +186,6 @@ async function publishRuns(check_suite_id) {
             console.log(e);
         })).data;
 
-        let targetFilename = null;
         let regExp = new RegExp(BUILD_FILE_HASHES_REGEX, 'gm');
         let match = regExp.exec(logs);
         if (!match) {
@@ -161,28 +203,36 @@ async function publishRuns(check_suite_id) {
 
         console.log('buildFileHashes: ' + JSON.stringify(buildFileHashes));
 
-        console.log(`Looking for the filename of artifact with the hash ${fileHash}.`);
+        let hasHashError = false;
+        for (let i = 0; i < request.files.length; i++) {
+            let file = request.files[i];
+            console.log(`Looking for the filename of artifact with the hash ${file.hash}.`);
 
-        let buildFileHashPair = buildFileHashes.find((buildFileHash) => {
-            return buildFileHash.sha256_checksum === fileHash;
-        });
+            let buildFileHashPair = buildFileHashes.find((buildFileHash) => {
+                return buildFileHash.sha256_checksum === file.hash;
+            });
 
-        if (!buildFileHashPair) {
-            console.log(`Failed to find build hash in JSON object.`);
-            continue;
+            if (!buildFileHashPair) {
+                hasHashError = true;
+                console.log(`Failed to find build hash in JSON object. Bailing.`);
+                break;
+            }
+
+            file.name = buildFileHashPair.filename;
+            file.extname = path.extname(file.name);
+            file.basename = path.basename(file.name, file.extname);
+
+            console.log(`Found ${file.name} with selected hash ${file.hash}.`);
         }
 
-        targetFilename = buildFileHashPair.filename;
-
-        console.log(`Found ${targetFilename} with selected hash ${fileHash}.`);
+        if (hasHashError) {
+            console.log(`Hash error found. Publishing for ${job_name} terminated`);
+            continue;
+        }
 
         publishUrls[job_name] = [];
 
         // Storage
-        let file_name = targetFilename;
-        let file_extname = path.extname(file_name);
-        let file_basename = path.basename(file_name, file_extname);
-
         const repositoryStorages = repositoryConfig.storages;
         for (let repositoryStorageKey in repositoryStorages) {
             if (!repositoryStorages.hasOwnProperty(repositoryStorageKey)) {
@@ -191,59 +241,64 @@ async function publishRuns(check_suite_id) {
 
             const repositoryStorage = repositoryStorages[repositoryStorageKey];
             const storage = config.storages[repositoryStorage.storage];
-            const storageParams = {
-                owner,
-                repo,
-                pull_number,
-                file_name,
-                file_basename,
-                file_extname,
-                commit_short_hash: commit_hash.substring(0, 8)
-            };
-            const storagePath = getStoragePath(storage.path, storageParams);
 
-            if (storage.method === 'file') {
-                try {
-                    let storageDirectory = path.dirname(storagePath);
-                    if (!fs.existsSync(storageDirectory)) {
-                        fs.mkdirSync(storageDirectory, { recursive: true });
-                    }
-                    await fs.writeFile(storagePath, request.body, function (err) {
-                        if (err) {
-                            throw err;
+            for (let i = 0; i < request.files.length; i++) {
+                let file = request.files[i];
+                const storageParams = {
+                    owner,
+                    repo,
+                    pull_number,
+                    file_name: file.name,
+                    file_basename: file.basename,
+                    file_extname: file.extname,
+                    file_hash: file.hash,
+                    commit_short_hash: commit_hash.substring(0, 8)
+                };
+
+                const storagePath = getStoragePath(storage.path, storageParams);
+                if (storage.method === 'file') {
+                    try {
+                        let storageDirectory = path.dirname(storagePath);
+                        if (!fs.existsSync(storageDirectory)) {
+                            fs.mkdirSync(storageDirectory, {recursive: true});
                         }
-                        console.log('Saved ' + fileHash + '!');
-                    });
-                    if (repositoryStorage.publish_url) {
-                        publishUrls[job_name].push(storagePath);
+                        await fs.writeFile(storagePath, file.buffer, function (err) {
+                            if (err) {
+                                throw err;
+                            }
+                            console.log('Saved ' + file.hash + '!');
+                        });
+                        if (repositoryStorage.publish_url) {
+                            publishUrls[job_name].push(storagePath);
+                        }
+                    } catch (err) {
+                        Sentry.captureException(err);
+                        console.log(JSON.stringify(err));
+                        continue;
                     }
-                } catch (err) {
-                    Sentry.captureException(err);
-                    console.log(JSON.stringify(err));
-                    continue;
-                }
-            } else if (storage.method === 'S3') {
-                // Create S3 service object
-                let s3 = new AWS.S3({
-                    apiVersion: '2006-03-01',
-                    region: storage.region,
-                    credentials: new AWS.Credentials(storage.accessKeyId, storage.secretAccessKey)
-                });
-                let data = (await s3.upload({
-                    Bucket: storage.bucket,
-                    Key: storagePath,
-                    Body: request.body,
-                    ACL: 'public-read'
-                }).promise().catch((err) => {
-                    console.log("Error", err);
-                }));
-                console.log('s3 upload output = ' + JSON.stringify(data));
+                } else if (storage.method === 'S3') {
+                    // Create S3 service object
+                    let s3 = new AWS.S3({
+                        apiVersion: '2006-03-01',
+                        region: storage.region,
+                        credentials: new AWS.Credentials(storage.accessKeyId, storage.secretAccessKey)
+                    });
+                    let data = (await s3.upload({
+                        Bucket: storage.bucket,
+                        Key: storagePath,
+                        Body: file.buffer,
+                        ACL: 'public-read'
+                    }).promise().catch((err) => {
+                        console.log("Error", err);
+                    }));
+                    console.log('s3 upload output = ' + JSON.stringify(data));
 
-                if (repositoryStorage.publish_url) {
-                    publishUrls[job_name].push(getStoragePath(storage.public_url, storageParams));
+                    if (repositoryStorage.publish_url) {
+                        publishUrls[job_name].push(getStoragePath(storage.public_url, storageParams));
+                    }
                 }
+                console.log(storagePath);
             }
-            console.log(storagePath);
         }
     }
 
@@ -251,6 +306,7 @@ async function publishRuns(check_suite_id) {
         return a.concat(b);
     }).length;
 
+    // Only comment on PR if public urls are available
     if (urlCount > 0) {
         let message = "";
         for (let publishUrlJobName in publishUrls) {
@@ -262,7 +318,6 @@ async function publishRuns(check_suite_id) {
                 message += `**${publishUrlJobName}**\n - ` + urls.join('\n - ') + '\n\n';
             }
         }
-
 
         // Publish a message with build links
         octokit.issues.createComment({
@@ -281,9 +336,6 @@ app.listen(LISTENING_PORT, () => console.log(`App listening on port ${LISTENING_
 
 app.put('/', async function (request, response) {
     try {
-        const fileHash = crypto.createHash('sha256').update(request.body).digest('hex');
-        request.fileHash = fileHash;
-        console.log(fileHash);
         const {owner, repo, commit_hash, pull_number, job_name, run_id} = request.headers;
 
         let check_run_data = (await octokit.checks.listForRef({
@@ -334,6 +386,10 @@ app.post('/webhook', async function(request, response) {
     }
 
     if (event === 'check_suite' && request.body.action === 'completed') {
-        await publishRuns(request.body.check_suite.id)
+        await publishRuns(request.body.check_suite.id);
+        response.status(HttpStatus.OK).send('Check suite completed request handled.');
+        return;
+
     }
+    response.status(HttpStatus.OK).send('Request handled.');
 });
