@@ -293,7 +293,7 @@ async function publishRuns(check_suite_id) {
                     }));
                     console.log('s3 upload output = ' + JSON.stringify(data));
 
-                    if (repositoryStorage.publish_url) {
+                    if (data !== undefined && repositoryStorage.publish_url) {
                         publishUrls[job_name].push(getStoragePath(storage.public_url, storageParams));
                     }
                 }
