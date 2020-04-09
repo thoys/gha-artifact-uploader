@@ -10,6 +10,9 @@ storages:
     region: your-s3-region
     path: builds/PR/[:owner]_[:repo]/PR[:pull_number]/[:file_basename]_[:commit_short_hash][:file_extname]
     public_url: https://your-bucket-url.s3.amazonaws.com/builds/PR/[:owner]_[:repo]/PR[:pull_number]/[:file_basename]_[:commit_short_hash][:file_extname]
+    # acl could be set in case that you have permissions to set this option. In the case of a public facing S3 repo you don't have to set this.
+    #
+    # acl: public-read
   local_disk:
     method: file
     path: ./storage/[:owner]_[:repo]/PR[:pull_number]/[:file_basename]_[:commit_short_hash][:file_extname]

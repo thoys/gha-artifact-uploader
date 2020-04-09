@@ -287,7 +287,7 @@ async function publishRuns(check_suite_id) {
                         Bucket: storage.bucket,
                         Key: storagePath,
                         Body: file.buffer,
-                        ACL: 'public-read'
+                        ACL: storage.acl
                     }).promise().catch((err) => {
                         console.log("Error", err);
                     }));
