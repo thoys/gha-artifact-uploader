@@ -1,7 +1,7 @@
 {
-  "name": "project-athena-build-uploader",
-  "version": "1.0.0",
-  "description": "",
+  "name": "gha-artifact-uploader",
+  "version": "0.4.0",
+  "description": "Webservice that verifies GHA projects and allows you to upload them to remote storage providers.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
