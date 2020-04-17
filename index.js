@@ -55,12 +55,15 @@ app.use(async (request, response, next) => {
             .send(`Please label PR build next time with the ${BUILD_UPLOAD_ALLOWED_LABEL} label.`);
         return;
     }
+    const GITHUB_MAX_VISIBLE_COMMITS = 250;
+    let last_commit_page = pull_data.commits > GITHUB_MAX_VISIBLE_COMMITS ? GITHUB_MAX_VISIBLE_COMMITS : pull_data.commits;
+
     let pull_commits = (await octokit.pulls.listCommits({
         owner,
         repo,
         pull_number,
         per_page: 1,
-        page: pull_data.commits
+        page: last_commit_page
     })).data;
     if (!pull_commits.some(commit => commit.sha === commit_hash)) {
         response.status(HttpStatus.INTERNAL_SERVER_ERROR)
