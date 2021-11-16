@@ -11,7 +11,7 @@
   "dependencies": {
     "@octokit/rest": "^17.1.4",
     "@sentry/node": "^5.10.2",
-    "aws-sdk": "^2.653.0",
+    "aws-sdk": "^2.814.0",
     "concat-stream": "^2.0.0",
     "crypto": "^1.0.1",
     "express": "^4.17.1",
